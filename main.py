@@ -4,6 +4,8 @@ from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 import numpy as np
 import random
 import pandas as pd
+from torch.utils.data import DataLoader
+import time
 
 import os
 
@@ -414,4 +416,193 @@ def log_loss(net_ensemble, test_loader):
 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+##Training
+
+c0_ = np.log(np.mean(train_targets_counted.iloc[:, 1:].values, axis=0))
+
+def train_fn(seed=0):
+    oof = np.zeros((len(train), len(target_cols)))
+    predictions = np.zeros((len(test), len(target_cols)))
+
+    for fold in range(params["number_folds"]):
+        seed_everything(seed)
+
+        train_idx = train[train["kfold"] != fold].index
+        val_idx = train[train["kfold"] == fold].index
+
+        train_df = train[train["kfold"] != fold].reset_index(drop=True)
+        val_df = train[train["kfold"] == fold].reset_index(drop=True)
+
+        x_train = train_df[value_cols].values
+        y_train = train_df[target_cols].values  #
+
+        x_val = val_df[value_cols].values  #
+        y_val = val_df[target_cols].values  #
+
+        train_ds = MyDataset(x_train, y_train)
+        val_ds = MyDataset(x_val, y_val)
+        train_loader = DataLoader(train_ds, batch_size=params["batch_size"], shuffle=True)
+        val_loader = DataLoader(val_ds, batch_size=params["batch_size"], shuffle=False)
+
+        best_score = np.inf
+        val_score = best_score
+        best_stage = params["number_nets"] - 1
+
+        c0 = torch.tensor(c0_, dtype=torch.float).to(device)
+        net_ensemble = DynamicModelNet(c0, params["boost_rate"])
+        loss_f1 = nn.MSELoss(reduction='none')
+
+        loss_f2 = SmoothingBCEwithLogits(reduction="none", smoothing=0.001)
+        loss_models = torch.zeros((params["number_nets"], 3))
+
+        all_ensm_losses = []
+        all_ensm_losses_te = []
+        all_mdl_losses = []
+        dynamic_br = []
+
+        lr = params["lr"]
+        L2 = params["weight_decay"]
+
+        early_stop = 0
+        for stage in range(params["number_nets"]):
+            t0 = time.time()
+
+            model = MLP_2HidLay.get_model(stage, params)  # Initialize the model_k: f_k(x), multilayer perception v2
+            model.to(device)
+
+
+            optimizer = get_optim(model.parameters(), lr, L2)
+            net_ensemble.to_train()  # Set the models in ensemble net to train mode
+            stage_mdlloss = []
+            for epoch in range(params["epochs_per_stage"]):
+                for i, data in enumerate(train_loader):
+                    # x_obj=data["x"].astype('object')
+                    # y_obj = data["y"].astype('object')
+                    x = data["x"].to(device)
+                    y = data["y"].to(device)
+                    middle_feat, out = net_ensemble.forward(x)
+                    if params["model_order"] == 'first':
+                        grad_direction = y / (1.0 + torch.exp(y * out))
+                    else:
+                        h = 1 / ((1 + torch.exp(y * out)) * (1 + torch.exp(-y * out)))
+                        grad_direction = y * (1.0 + torch.exp(-y * out))
+                        nwtn_weights = (torch.exp(out) + torch.exp(-out)).abs()
+                    _, out = model(x, middle_feat)
+                    loss = loss_f1(net_ensemble.boost_rate * out, grad_direction)  # T
+                    loss = loss * h
+                    loss = loss.mean()
+                    model.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    stage_mdlloss.append(loss.item())
+
+            net_ensemble.add(model)
+            sml = np.mean(stage_mdlloss)
+
+            stage_loss = []
+            lr_scaler = 2
+            # fully-corrective step
+            if stage != 0:
+                # Adjusting corrective step learning rate
+                if stage % 3 == 0:
+                    lr /= 2
+
+                optimizer = get_optim(net_ensemble.parameters(), lr / lr_scaler, L2)
+                for _ in range(params["correct_epoch"]):
+                    for i, data in enumerate(train_loader):
+                        x = data["x"]
+                        y = data["y"]
+
+                        _, out = net_ensemble.forward_grad(x)
+
+                        loss = loss_f2(out, y).mean()
+                        optimizer.zero_grad()
+                        loss.backward()
+                        optimizer.step()
+                        stage_loss.append(loss.item())
+
+            sl_te = log_loss(net_ensemble, val_loader)
+            dynamic_br.append(net_ensemble.boost_rate.item())
+
+
+            elapsed_tr = time.time() - t0
+            sl = 0
+            if stage_loss != []:
+                sl = np.mean(stage_loss)
+
+            all_ensm_losses.append(sl)
+            all_ensm_losses_te.append(sl_te)
+            all_mdl_losses.append(sml)
+            print(
+                f'Stage - {stage}, training time: {elapsed_tr: .1f} sec, boost rate: {net_ensemble.boost_rate: .4f}, Training Loss: {sl: .5f}, Val Loss: {sl_te: .5f}')
+
+            net_ensemble.to_cuda()
+            net_ensemble.to_eval()  # Set the models in ensemble net to eval mode
+
+            # Train
+            if sl_te < best_score:
+                best_score = sl_te
+                best_stage = stage
+                net_ensemble.to_file(f"./{fold}FOLD_{seed}_.pth")
+                early_stop = 0
+            else:
+
+                early_stop += 1
+
+            if early_stop > params["early_stopping_steps"]:
+                print("early stopped!")
+                break
+
+        print(f'Best validation stage: {best_stage}')
+
+        net_ensemble = DynamicModelNet.from_file(f"./{fold}FOLD_{seed}_.pth", lambda stage: MLP_2HidLay.get_model(stage, params))
+        net_ensemble.to_cuda()
+        net_ensemble.to_eval()
+
+        preds = []
+        with torch.no_grad():
+            for data in val_loader:
+                x = data["x"].to(device)
+                _, pred = net_ensemble.forward(x)
+                preds.append(pred.sigmoid().detach().cpu().numpy())
+        oof[val_idx, :] = np.concatenate(preds)
+
+        x_test = test[value_cols].values
+        test_ds = TestDataset(x_test)
+        test_loader = DataLoader(test_ds, batch_size=params["batch_size"], shuffle=False)
+
+        preds = []
+        with torch.no_grad():
+            for data in test_loader:
+                x = data["x"].to(device)
+                _, pred = net_ensemble.forward(x)
+                preds.append(pred.sigmoid().detach().cpu().numpy())
+        predictions += np.concatenate(preds) / params["n_folds"]
+
+    oof = np.clip(oof, 1e-3, 1 - 1e-3)
+    predictions = np.clip(predictions, 1e-3, 1 - 1e-3)
+
+    train[target_cols] = oof
+    test[target_cols] = predictions
+
+    val_results = train_targets_counted.drop(columns=target_cols).merge(train[["sig_id"] + target_cols], on="sig_id",
+                                                                       how="left").fillna(0)
+
+    y_true = train_targets_counted[target_cols].values
+    y_pred = val_results[target_cols].values
+
+    score = 0
+    for i in range(len(target_cols)):
+        score_ = log_loss(y_true[:, i], y_pred[:, i])
+        score += score_ / len(target_cols)
+    print("CV log_loss ", score)
+
+    sub = sample_submission
+    sub = sub.drop(columns=target_cols).merge(test[["sig_id"] + target_cols], on="sig_id", how="left").fillna(0)
+
+    return sub
+
+
+sub = train_fn()
 
